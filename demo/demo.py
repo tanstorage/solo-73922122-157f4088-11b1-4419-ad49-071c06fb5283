@@ -11,10 +11,12 @@
    会话内取页结果不变。
 3. 名额控制：最多 2 个会话，第 3 个开启请求被 429 拒绝；
    关闭一个后名额归还，可再开；另一个会话不受影响。
-4. 慢取页 + 及时关闭：用 X-Debug-Sleep-Seconds 头让取页变慢，
-   在它响应前发起关闭，关闭返回后再取页 -> 409 且无明细。
-5. 到期失效（可选，较慢）：设置 DEMO_TTL_WAIT=1 时，
-   等待会话到期后取页 -> 410 且无明细。
+4. 未开始的取页 + 关闭：X-Debug-Pre-Sleep-Seconds 让请求在开始响应前等待，
+   关闭受理后它不执行 SQL，直接 409 且无明细。
+5. SQL 执行中关闭：X-Debug-SQL-Sleep-Seconds 让 SQL 在库内真实执行 20 秒，
+   关闭时立即停止该会话的 SQL，请求尽快以 409 返回且无明细。
+6. 到期失效（可选，DEMO_TTL_WAIT=1）：会话在 SQL 执行中到期，
+   到期清理停止 SQL，取页 410 且无明细，名额归还。
 """
 from __future__ import annotations
 
@@ -140,17 +142,17 @@ def main() -> int:
     call("POST", f"/sessions/{sid3}/close")
 
     # ------------------------------------------------------------------
-    title(4, "慢取页演示：关闭及时受理，受理后未开始响应的取页失败且无明细")
+    title(4, "未开始的取页 + 关闭：受理后立即失败，不等它自然结束")
     _, s4 = call("POST", "/sessions", {"region": "华东"})
     sid4 = s4["session_id"]
     box = {}
 
     def slow_page():
         box["t0"] = time.time()
-        # 服务端收到请求后先睡眠 4 秒再执行 SQL
+        # 服务端收到请求后先等待 5 秒才开始执行 SQL（尚未开始响应）
         box["result"] = call(
             "GET", f"/sessions/{sid4}/claims?page=1&page_size=10",
-            headers={"X-Debug-Sleep-Seconds": "4"}, timeout=15,
+            headers={"X-Debug-Pre-Sleep-Seconds": "5"}, timeout=15,
         )
         box["t1"] = time.time()
 
@@ -161,12 +163,12 @@ def main() -> int:
     st, info = call("POST", f"/sessions/{sid4}/close")
     t_close1 = time.time()
     check(st == 200 and info["status"] == "closed",
-          f"关闭请求在 {t_close1 - t_close0:.2f}s 内受理完成，状态=closed")
+          f"关闭请求在 {t_close1 - t_close0:.2f}s 内完成，状态=closed")
     t.join()
     st_slow, body_slow = box["result"]
-    print(f"    慢取页最终返回: HTTP {st_slow}，耗时 {box['t1'] - box['t0']:.2f}s，"
+    print(f"    未开始的取页最终返回: HTTP {st_slow}，耗时 {box['t1'] - box['t0']:.2f}s，"
           f"响应={json.dumps(body_slow, ensure_ascii=False)[:120]}")
-    check(st_slow in (409, 410), "慢取页在关闭后失败（409/410），未返回明细")
+    check(st_slow in (409, 410), "未开始的取页在关闭后失败（409/410），未返回明细")
     check(isinstance(body_slow, dict) and "rows" not in body_slow, "失败响应不含任何理赔明细行")
 
     st, after = call("GET", f"/sessions/{sid4}/claims?page=1")
@@ -180,15 +182,76 @@ def main() -> int:
     call("POST", f"/sessions/{s5['session_id']}/close")
 
     # ------------------------------------------------------------------
+    title(5, "SQL 执行中关闭：及时停止该会话正在执行的 SQL，且不返回明细")
+    _, s8 = call("POST", "/sessions", {"region": "华东"})
+    sid8 = s8["session_id"]
+    box8 = {}
+
+    def long_sql_page():
+        box8["t0"] = time.time()
+        # 数据库内真实执行 20 秒的 SQL（pg_sleep），模拟大页/慢查询
+        box8["result"] = call(
+            "GET", f"/sessions/{sid8}/claims?page=1&page_size=10",
+            headers={"X-Debug-SQL-Sleep-Seconds": "20"}, timeout=40,
+        )
+        box8["t1"] = time.time()
+
+    t8 = threading.Thread(target=long_sql_page)
+    t8.start()
+    time.sleep(1)  # 让 SQL 真正开始执行
+    t_close0 = time.time()
+    st, info = call("POST", f"/sessions/{sid8}/close")
+    t_close1 = time.time()
+    check(st == 200 and info["status"] == "closed",
+          f"SQL 执行中关闭在 {t_close1 - t_close0:.2f}s 内完成（SQL 原需 20s）")
+    t8.join()
+    st_sql, body_sql = box8["result"]
+    sql_elapsed = box8["t1"] - box8["t0"]
+    print(f"    执行中的取页最终返回: HTTP {st_sql}，耗时 {sql_elapsed:.2f}s，"
+          f"响应={json.dumps(body_sql, ensure_ascii=False)[:120]}")
+    check(st_sql in (409, 410), "执行中的取页在关闭后失败（409/410），未返回明细")
+    check(isinstance(body_sql, dict) and "rows" not in body_sql, "失败响应不含任何理赔明细行")
+    check(sql_elapsed < 10, "在途 SQL 被及时停止，未等它自然跑完")
+
+    st, info = call("GET", f"/sessions/{sid8}")
+    check(st == 200 and info["status"] == "closed", "关闭后会话状态仍可查询，终态=closed")
+    # 连接只归还一次，且不误停其它会话：另开一个会话照常取页
+    _, s9 = call("POST", "/sessions", {"region": "华东"})
+    st, other = call("GET", f"/sessions/{s9['session_id']}/claims?page=1&page_size=5")
+    check(st == 200 and len(other["rows"]) == 5, "随后新开的会话取页正常（连接未被误停/误还）")
+    call("POST", f"/sessions/{s9['session_id']}/close")
+
+    # ------------------------------------------------------------------
     if TTL_WAIT:
-        title(5, "到期失效：60 秒后会话自动到期，取页 410 且无明细")
+        title(6, "到期：60 秒后会话自动到期，执行中的 SQL 被停止，取页 410 且无明细")
         _, s6 = call("POST", "/sessions", {"region": "华南"})
         sid6 = s6["session_id"]
-        print("    等待 62 秒让会话到期 …")
-        time.sleep(62)
+        box6 = {}
+
+        def expiring_sql():
+            box6["t0"] = time.time()
+            box6["result"] = call(
+                "GET", f"/sessions/{sid6}/claims?page=1&page_size=5",
+                headers={"X-Debug-SQL-Sleep-Seconds": "30"}, timeout=120,
+            )
+            box6["t1"] = time.time()
+
+        t6 = threading.Thread(target=expiring_sql)
+        # 先让会话接近到期，再发起一条 30 秒的 SQL，使 SQL 执行中跨越到期点
+        print("    等待 45 秒，随后发起 30 秒 SQL，让它在执行中到期 …")
+        time.sleep(45)
+        t6.start()
+        time.sleep(17)  # 总计约 62 秒：会话到期
         st, expired = call("GET", f"/sessions/{sid6}/claims?page=1")
         check(st in (410, 409), f"到期后取页被拒绝 HTTP {st}，且无明细")
         check("rows" not in expired, "到期失败响应不含理赔明细行")
+        t6.join()
+        st_exp, body_exp = box6["result"]
+        exp_elapsed = box6["t1"] - box6["t0"]
+        print(f"    到期时执行中的取页最终返回: HTTP {st_exp}，耗时 {exp_elapsed:.2f}s")
+        check(st_exp in (409, 410), "到期打断了执行中的 SQL，取页失败")
+        check(isinstance(body_exp, dict) and "rows" not in body_exp,
+              "到期失败响应不含理赔明细行")
         st, info = call("GET", f"/sessions/{sid6}")
         check(st == 200 and info["status"] == "expired", "会话状态可查，终态=expired")
         st, s7 = call("POST", "/sessions", {"region": "华南"})

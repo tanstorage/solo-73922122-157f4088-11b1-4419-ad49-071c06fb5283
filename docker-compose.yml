@@ -27,10 +27,25 @@ services:
       MAX_SESSIONS: "2"
       SESSION_TTL_SECONDS: "60"
       PAGE_SIZE_CAP: "100"
-      # 开启后可用 X-Debug-Sleep-Seconds 头制造慢取页，供演示使用
+      # 关闭/到期后等待在途 SQL 响应 cancel 的宽限；超时强制中断该连接
+      CANCEL_GRACE_SECONDS: "1.0"
+      CLOSE_WAIT_TIMEOUT_SECONDS: "10"
+      # 开启后可用 X-Debug-SQL-Sleep-Seconds / X-Debug-Pre-Sleep-Seconds 演示
       ENABLE_DEBUG_HOOKS: "true"
     ports:
       - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
 
 volumes:
   pgdata:

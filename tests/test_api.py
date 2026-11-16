@@ -284,8 +284,249 @@ class TestCloseSemantics(ApiTestBase):
         self.assertEqual(self.page(s2["session_id"], page_size=5).status_code, 200)
         self.close(s2["session_id"])
 
+    # ------------------------------------------------------------------
+    # SQL 正在执行时关闭：及时停 SQL、失败无明细、只归还一次连接
+    # ------------------------------------------------------------------
+    def _wait_query_active(self, sid, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if manager.get_status(sid).query_active:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_close_while_sql_executing_stops_query_promptly(self):
+        """在途 SQL 真正执行时关闭：取消/断开使其尽快结束，且不返回明细。"""
+        s = self.open("华东")
+        sid = s["session_id"]
+        box = {}
+
+        def slow_sql():
+            t0 = time.time()
+            box["r"] = self.client.get(
+                f"/sessions/{sid}/claims",
+                params={"page": 1, "page_size": 10},
+                headers={"X-Debug-SQL-Sleep-Seconds": "20"},
+                timeout=30,
+            )
+            box["elapsed"] = time.time() - t0
+
+        t = threading.Thread(target=slow_sql)
+        t.start()
+        self.assertTrue(self._wait_query_active(sid), "取页 SQL 未进入执行状态")
+        t0 = time.time()
+        r = self.close(sid)
+        close_elapsed = time.time() - t0
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "closed")
+        # 关闭必须及时（远小于 20s 的 SQL 时长），不能等读取自然结束
+        self.assertLess(close_elapsed, 10, "关闭在等 SQL 自然结束")
+        t.join(timeout=15)
+        self.assertFalse(t.is_alive(), "取页请求未随关闭结束")
+        self.assertIn(box["r"].status_code, (409, 410))
+        self.assertNotIn("rows", box["r"].json())
+        self.assertLess(box["elapsed"], 10, "在途 SQL 未被及时停止")
+
+    def test_repeated_close_and_late_page_release_connection_once(self):
+        """重复关闭 + 迟到取页：连接只归还一次，名额不重复归还，不误停他人。"""
+        s = self.open("华东")
+        sid = s["session_id"]
+        box = {}
+
+        def slow_sql():
+            box["r"] = self.client.get(
+                f"/sessions/{sid}/claims",
+                params={"page": 1, "page_size": 10},
+                headers={"X-Debug-SQL-Sleep-Seconds": "20"},
+                timeout=30,
+            )
+
+        t = threading.Thread(target=slow_sql)
+        t.start()
+        self.assertTrue(self._wait_query_active(sid))
+
+        # 并发/重复关闭同一会话：都应以终态返回，且只归还一次连接
+        results = []
+
+        def do_close():
+            results.append(self.close(sid))
+
+        closers = [threading.Thread(target=do_close) for _ in range(3)]
+        for c in closers:
+            c.start()
+        for c in closers:
+            c.join(timeout=15)
+        t.join(timeout=15)
+        statuses = [r.json()["status"] for r in results]
+        self.assertEqual(statuses, ["closed"] * 3)
+        self.assertIn(box["r"].status_code, (409, 410))
+        self.assertNotIn("rows", box["r"].json())
+
+        # 名额只剩 1 个被占用：再开 1 个成功，之后第 2 个仍应 429
+        s2 = self.open("华南")
+        self.assertEqual(self.page(s2["session_id"], page_size=3).status_code, 200)
+        again = self.close(sid)  # 终态后再关闭：不得归还任何东西
+        self.assertEqual(again.json()["status"], "closed")
+        s3 = self.open("华北")  # 终态重复关闭没有额外腾出名额以外的资源
+        self.assertEqual(s3["status"], "open")
+        extra = self.client.post("/sessions", json={"region": "华东"})
+        self.assertEqual(extra.status_code, 429)
+        self.close(s2["session_id"])
+        self.close(s3["session_id"])
+        s4 = self.open("华北")
+        self.assertEqual(s4["status"], "open")
+        self.close(s4["session_id"])
+
+    def test_close_does_not_cancel_other_session_or_reused_connection(self):
+        """关闭 A 期间，B（含复用池连接的后续新会话）的取页不得被误停。"""
+        s1 = self.open("华东")
+        s2 = self.open("华南")
+        sid1, sid2 = s1["session_id"], s2["session_id"]
+        box = {}
+
+        def slow_sql_a():
+            box["a"] = self.client.get(
+                f"/sessions/{sid1}/claims",
+                params={"page": 1, "page_size": 5},
+                headers={"X-Debug-SQL-Sleep-Seconds": "20"},
+                timeout=30,
+            )
+
+        t = threading.Thread(target=slow_sql_a)
+        t.start()
+        self.assertTrue(self._wait_query_active(sid1))
+        # B 会话在同一时间段执行的慢 SQL 必须完整跑完（TTL 内）
+        r2 = self.client.get(
+            f"/sessions/{sid2}/claims",
+            params={"page": 1, "page_size": 5},
+            headers={"X-Debug-SQL-Sleep-Seconds": "0.8"},
+            timeout=30,
+        )
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(len(r2.json()["rows"]), 5)
+        self.close(sid1)
+        t.join(timeout=15)
+        self.assertIn(box["a"].status_code, (409, 410))
+
+        # 新会话复用连接池中归还的连接：其取页必须正常工作
+        s3 = self.open("华东")
+        r3 = self.page(s3["session_id"], page_size=5)
+        self.assertEqual(r3.status_code, 200)
+        self.assertEqual(len(r3.json()["rows"]), 5)
+        self.close(s3["session_id"])
+        self.close(sid2)
+
+    def test_connection_returned_exactly_once(self):
+        """并发关闭 + 迟到取页：同一连接只归还一次，不会重复归还。"""
+        s = self.open("华南")
+        sid = s["session_id"]
+        sess = manager.get_status(sid)
+        pool = manager.pool()
+        orig_putconn = pool.putconn
+        returned = []
+
+        def spy(conn):
+            if conn is sess.conn:
+                returned.append(conn)
+            return orig_putconn(conn)
+
+        pool.putconn = spy
+        box = {}
+        try:
+            def slow_sql():
+                box["r"] = self.client.get(
+                    f"/sessions/{sid}/claims",
+                    params={"page": 1, "page_size": 5},
+                    headers={"X-Debug-SQL-Sleep-Seconds": "20"},
+                    timeout=30,
+                )
+
+            t = threading.Thread(target=slow_sql)
+            t.start()
+            self.assertTrue(self._wait_query_active(sid))
+            closers = [
+                threading.Thread(target=lambda: self.close(sid))
+                for _ in range(3)
+            ]
+            for c in closers:
+                c.start()
+            for c in closers:
+                c.join(timeout=15)
+            t.join(timeout=15)
+            # 迟到取页 + 再次关闭都不应触发第二次归还
+            self.assertIn(box["r"].status_code, (409, 410))
+            self.assertEqual(self.close(sid).json()["status"], "closed")
+            self.assertEqual(self.page(sid).status_code, 409)
+        finally:
+            pool.putconn = orig_putconn
+        self.assertEqual(len(returned), 1, "连接被重复归还连接池")
+        s2 = self.open("华南")
+        self.assertEqual(s2["status"], "open")
+        self.close(s2["session_id"])
+
+    def test_close_after_sql_completed_but_before_response_prepared(self):
+        """SQL 已跑完、关闭随即受理：本页也不得返回明细。"""
+        s = self.open("华南")
+        sid = s["session_id"]
+        box = {}
+
+        def fetch():
+            box["r"] = self.client.get(
+                f"/sessions/{sid}/claims",
+                params={"page": 1, "page_size": 5},
+                headers={"X-Debug-Pre-Sleep-Seconds": "2"},
+                timeout=15,
+            )
+
+        t = threading.Thread(target=fetch)
+        t.start()
+        time.sleep(0.5)  # 请求已到达，但尚未开始执行 SQL
+        self.close(sid)
+        t.join(timeout=10)
+        self.assertIn(box["r"].status_code, (409, 410))
+        self.assertNotIn("rows", box["r"].json())
+
 
 class TestExpiry(ApiTestBase):
+    def test_expiry_while_sql_executing_stops_query(self):
+        """到期瞬间正在执行的 SQL 被及时停止，响应 410 且无明细。"""
+        s = self.open("华东")
+        sid = s["session_id"]
+        box = {}
+
+        def slow_sql():
+            t0 = time.time()
+            box["r"] = self.client.get(
+                f"/sessions/{sid}/claims",
+                params={"page": 1, "page_size": 5},
+                headers={"X-Debug-SQL-Sleep-Seconds": "20"},
+                timeout=40,
+            )
+            box["elapsed"] = time.time() - t0
+
+        t = threading.Thread(target=slow_sql)
+        t.start()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if manager.get_status(sid).query_active:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("取页 SQL 未进入执行状态")
+        # 会话在第 1 秒左右到期（TTL=2）；SQL 需要 20 秒，必须被打断
+        t.join(timeout=15)
+        self.assertFalse(t.is_alive(), "到期后取页仍在等 SQL 自然结束")
+        self.assertEqual(box["r"].status_code, 410)
+        self.assertNotIn("rows", box["r"].json())
+        self.assertLess(box["elapsed"], TTL + 5)
+        info = self.client.get(f"/sessions/{sid}").json()
+        self.assertEqual(info["status"], "expired")
+        # 名额已归还
+        a = self.open("华东")
+        b = self.open("华北")
+        self.close(a["session_id"])
+        self.close(b["session_id"])
+
     def test_expiry_rejects_pages_and_releases_slot(self):
         s = self.open("华南")
         sid = s["session_id"]
@@ -339,14 +580,14 @@ class TestConnectionLossAndRestart(ApiTestBase):
         self._terminate_session_backend(sid)
         r = self.page(sid)
         # 旧会话直接失败，绝不换连接/换快照续取；
-        # 409（清理线程先标记终态）或 503（取页时发现连接断裂）均合规
-        self.assertIn(r.status_code, (409, 503))
+        # 409/410（清理线程已判到期/关闭）或 503（取页时发现连接断裂）均合规
+        self.assertIn(r.status_code, (409, 410, 503))
         self.assertNotIn("rows", r.json())
         # 旧 id 无法续取（失效会话已移出注册表或已为终态）
         info = self.client.get(f"/sessions/{sid}")
         if info.status_code == 200:
             self.assertIn(info.json()["status"], ("closed", "expired"))
-            self.assertEqual(self.page(sid).status_code, 409)
+            self.assertIn(self.page(sid).status_code, (409, 410))
         else:
             self.assertEqual(info.status_code, 404)
         # 新会话在池恢复后的连接上正常开启

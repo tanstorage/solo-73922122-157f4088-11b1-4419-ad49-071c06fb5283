@@ -22,6 +22,8 @@ class Settings:
     session_ttl_seconds: int
     page_size_cap: int
     sweeper_interval_seconds: float
+    close_wait_timeout_seconds: float
+    cancel_grace_seconds: float
     enable_debug_hooks: bool
     pool_min_size: int
     pool_max_size: int
@@ -38,6 +40,12 @@ class Settings:
             page_size_cap=_int_env("PAGE_SIZE_CAP", 100),
             sweeper_interval_seconds=float(
                 os.environ.get("SWEEPER_INTERVAL_SECONDS", "0.25")
+            ),
+            close_wait_timeout_seconds=float(
+                os.environ.get("CLOSE_WAIT_TIMEOUT_SECONDS", "10")
+            ),
+            cancel_grace_seconds=float(
+                os.environ.get("CANCEL_GRACE_SECONDS", "1.0")
             ),
             enable_debug_hooks=os.environ.get(
                 "ENABLE_DEBUG_HOOKS", "false"

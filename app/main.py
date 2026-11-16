@@ -85,6 +85,8 @@ def meta():
         "max_sessions": settings.max_sessions,
         "session_ttl_seconds": settings.session_ttl_seconds,
         "page_size_cap": settings.page_size_cap,
+        "close_wait_timeout_seconds": settings.close_wait_timeout_seconds,
+        "cancel_grace_seconds": settings.cancel_grace_seconds,
         "debug_hooks_enabled": settings.enable_debug_hooks,
     }
 
@@ -165,21 +167,35 @@ async def fetch_claims(
 ):
     page_size = min(page_size, settings.page_size_cap)
 
-    # 演示用慢取页钩子：仅当 ENABLE_DEBUG_HOOKS=true 时生效，
-    # 通过 X-Debug-Sleep-Seconds 请求头让本次 SQL 前先睡眠若干秒。
-    # 睡眠放在线程池中，不阻塞事件循环与其它请求。
+    # 演示用慢取页钩子：仅当 ENABLE_DEBUG_HOOKS=true 时生效。
+    # X-Debug-SQL-Sleep-Seconds：让本页 SQL 在数据库内真实执行 sleep，模拟
+    #   “SQL 正在执行”的慢查询——关闭/到期会取消并立即打断该 SQL。
+    # X-Debug-Pre-Sleep-Seconds：让请求在开始响应前先等待，模拟“尚未开始
+    #   响应”的取页——关闭/到期受理后它不会执行 SQL，直接失败且无明细。
+    # X-Debug-Sleep-Seconds：旧头名，等同 X-Debug-Pre-Sleep-Seconds。
+    # 睡眠都放在线程池中，不阻塞事件循环与其它请求。
+    sql_sleep = 0.0
     if settings.enable_debug_hooks:
-        raw = request.headers.get("x-debug-sleep-seconds")
+        # 兼容旧演示头：X-Debug-Sleep-Seconds 语义为“开始响应前等待”。
+        raw = request.headers.get(
+            "x-debug-pre-sleep-seconds"
+        ) or request.headers.get("x-debug-sleep-seconds")
         if raw:
             try:
-                delay = max(0.0, min(30.0, float(raw)))
+                delay = max(0.0, min(120.0, float(raw)))
             except ValueError:
                 raise HTTPException(status_code=400, detail="非法的调试延迟头")
             await asyncio.to_thread(time.sleep, delay)
+        raw_sql = request.headers.get("x-debug-sql-sleep-seconds")
+        if raw_sql:
+            try:
+                sql_sleep = max(0.0, min(120.0, float(raw_sql)))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="非法的调试延迟头")
 
     session = await asyncio.to_thread(manager.get_status, session_id)
     rows, has_more = await asyncio.to_thread(
-        manager.fetch_page, session_id, page, page_size
+        manager.fetch_page, session_id, page, page_size, sql_sleep
     )
     return ClaimPage(
         session_id=session_id,
